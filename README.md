@@ -54,6 +54,13 @@ uv pip install flash-attn --no-build-isolation
 git submodule update --init --recursive
 ```
 
+3. Log into Hugging Face:
+prime uses gated models tokenizers [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1), [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf) and pulls the [C4:en](https://huggingface.co/datasets/allenai/c4) dataset subset. It is required to request access to the models then log into Hugging Face with a read token to begin training.
+```bash
+huggingface-cli login
+```
+
+
 ### Quick Check
 
 Verify your setup:
