@@ -230,6 +230,7 @@ def train(config: Config):
         scheduler=scheduler,
         dataloader=train_dataloader,
         training_progress=training_progress,
+        data_rank=config.data.data_rank,
         diloco_offloaded_optimizer=diloco.outer_optimizer if config.diloco is not None else None,
         diloco_offloaded_param_list=diloco.param_list_cpu if config.diloco is not None else None,
         live_recovery_port=elastic_device_mesh.live_recovery.port if config.ckpt.live_recovery else None,

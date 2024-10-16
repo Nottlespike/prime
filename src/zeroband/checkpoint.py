@@ -150,6 +150,9 @@ class CkptConfig(BaseConfig):
 
     remote: RemoteConfig | None = None
 
+    remote_data_path: str | None = None
+    remote_data_load: bool = False
+
     resume: str | None = None
 
     skip_dataloader: bool = False
@@ -170,6 +173,29 @@ class CkptConfig(BaseConfig):
             raise ValueError("remote_path is set but path is not set")
 
         return self
+
+    @model_validator(mode="after")
+    def validate_remote_data_path(self):
+        if self.remote_data_path is not None and self.data_version == "v1":
+            raise ValueError("remote_data_path is only available with data_version v2")
+
+        if self.remote_data_load and self.data_version == "v1":
+            raise ValueError("remote_data_load is only available with data_version v2")
+
+        if self.remote_data_load and self.data_path is not None:
+            raise ValueError("remote_data_load and data_path are mutually exclusive")
+
+        if self.remote_data_load and self.remote_data_path is None:
+            raise ValueError("remote_data_load is set but remote_data_path is not set")
+        return self
+
+
+def non_error_barrier():
+    logger = get_logger()
+    try:
+        dist.barrier()
+    except Exception as e:
+        logger.info(f"Error in data checkpointing barrier: {e}, continuing training")
 
 
 class CkptManager:
@@ -195,6 +221,7 @@ class CkptManager:
         scheduler: LambdaLR,
         dataloader: StatefulDataLoader,
         training_progress: TrainingProgress,
+        data_rank: int,
         diloco_offloaded_param_list: list[nn.Parameter] | None,
         diloco_offloaded_optimizer: Optimizer | None,
         live_recovery_port: int | None = None,
@@ -206,6 +233,7 @@ class CkptManager:
         self.scheduler = scheduler
         self.dataloader = dataloader
         self.training_progress = training_progress
+        self.data_rank = data_rank
 
         assert (diloco_offloaded_param_list is None) == (
             diloco_offloaded_optimizer is None
@@ -220,6 +248,7 @@ class CkptManager:
         self._logger = get_logger()
         self.world_info = get_world_info()
 
+        self.non_blocking_process: list[multiprocessing.Process] = []
         self.blocking_process: list[multiprocessing.Process] = []
 
         if self.config.live_recovery:
@@ -238,6 +267,9 @@ class CkptManager:
 
             if self.config.remote is not None:
                 self.check_path_access(self.config.remote.path)
+
+            if self.config.remote_data_path is not None:
+                self.check_path_access(self.config.remote_data_path)
 
     def check_path_access(
         self,
@@ -312,10 +344,12 @@ class CkptManager:
 
         else:
             # if we are in self recovery mode the ckpt is already in shm and we just copy
+            non_error_barrier()
             if self.world_info.local_rank == 0:
                 self._async_save_remote(self.shm_path, step_ckpt_path)
 
         # push to remote
+        non_error_barrier()
         if self.world_info.local_rank == 0:
             if remote and self.config.remote is not None:
                 ckpt_path = self.shm_path if self.config.live_recovery else step_ckpt_path
@@ -360,9 +394,22 @@ class CkptManager:
                     state = {"data_loader": self.dataloader.state_dict()}
                     torch.save(state, f)
 
+                non_error_barrier()
+
+                if self.config.remote_data_path is not None:
+                    remote_data_path = os.path.join(
+                        self.config.remote_data_path, f"data_{self.data_rank}", f"step_{self.training_progress.step}"
+                    )
+                    latest_remote_data_path = os.path.join(
+                        self.config.remote_data_path, f"data_{self.data_rank}", "latest"
+                    )
+
+                    self._async_save_remote(data_path, remote_data_path, blocking=False)
+                    self._async_save_remote(data_path, latest_remote_data_path, blocking=False)
+
         gc.collect()
 
-    def _async_save_remote(self, ckpt_path: str, remote_ckpt_path: str) -> None:
+    def _async_save_remote(self, ckpt_path: str, remote_ckpt_path: str, blocking: bool = True) -> None:
         """asyncronously rsync a ckpt folder to a remote location. Using fsspec to handle remote cloud storage without to install
         specific libraries (e.g. s3fs).
         """
@@ -381,7 +428,10 @@ class CkptManager:
         processes = multiprocessing.Process(target=rsync, daemon=True)
         processes.start()
 
-        self.blocking_process.append(processes)
+        if blocking:
+            self.blocking_process.append(processes)
+        else:
+            self.non_blocking_process.append(processes)
 
     def wait_for_blocking_job(self):
         for process in self.blocking_process:
@@ -399,14 +449,17 @@ class CkptManager:
             self.live_server.stop()
         self.wait_for_blocking_job()
 
+        for process in self.non_blocking_process:
+            process.join()
+
     def _load_data(self, resume_ckpt_path: str):
         ## we have two formats to to save the dataloader:
         ## 1. v1: save the dataloader in the same file as the outer optimizer
         ## 2. v2: save the dataloader in a data folder inside the ckpt path
+        self._logger.debug(f"loading data from {resume_ckpt_path}")
         world_info = get_world_info()
 
         if self.config.data_version == "v2":
-            self._logger.debug(f"data_path{resume_ckpt_path}")
             data_path = os.path.join(resume_ckpt_path, "data")
 
             if os.path.exists(os.path.join(data_path, f"_{world_info.local_rank}.pt")):
@@ -474,7 +527,15 @@ class CkptManager:
             opt_wrapper.load_state_dict(rank_state_dict["optimizer"])
 
         if not skip_dataloader:
-            data_path = resume_ckpt_path if data_path is None else data_path
+            if self.config.remote_data_load:
+                remote_data_path = os.path.join(self.config.remote_data_path, f"data_{self.data_rank}", "latest")
+                id_ = uuid.uuid4()
+                dest = f"/tmp/zeroband/data_{id_}"
+                rsync_fsspec(remote_data_path, os.path.join(dest, "data"))
+                data_path = dest
+            else:
+                data_path = resume_ckpt_path if data_path is None else data_path
+
             self._load_data(data_path)
 
         self._init_state()
