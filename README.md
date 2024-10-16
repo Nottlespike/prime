@@ -122,18 +122,70 @@ export HF_HUB_ETAG_TIMEOUT=500
 ```
 
 ## Pre-downloading datasets
-Streaming datasets from huggingface hub can sometimes result in http 443 errors which will crash the training process.
-To avoid them, you can pre-download the dataset with git lfs. (Which does not seem to have a rate limit at present.)
-You will first need to add your machine's SSH key to your authorized SSH keys on huggingface hub: https://huggingface.co/settings/keys.
-You can then clone the dataset repository without pulling the LFS files.
-We provide a script that takes `dataset_name`, `data_world_size` and `data_rank` and outputs a command that will `git rm` all parquet files that are not going to be seen by the given data rank.
-You can then execute the script to perform all the `git rm` and pull the remaining files from LFS.
 
-Here is an example that pulls all the files in `PrimeIntellect/fineweb-edu` which are used by `data_rank` 5 in a training with `data_world_size` of 12.
+To avoid potential HTTP 443 errors that can occur when streaming datasets from the Hugging Face hub during training crashing your run, you can pre-download the dataset using our custom script. This script efficiently downloads the required files for your specific data rank and world size configuration, utilizing multithreading for faster downloads.
+
+### Prerequisites
+
+Requirements:
+- `aria2c` (recommended) or `wget` (fallback) installed on your system
+  Note: `wget` is included by default in Ubuntu 22.04 LTS desktop installations
+
+- To install aria2c on Ubuntu 22.04 LTS, run:
 ```bash
-export GIT_LFS_SKIP_SMUDGE=1
-git clone git@hf.co:datasets/PrimeIntellect/fineweb-edu
-cd fineweb-edu/
-python3 ../subset_data.py --dataset_name PrimeIntellect/fineweb-edu --data_world_size 12 --data_rank 5
-bash rm-unused.sh
+sudo apt install aria2
 ```
+
+### Usage
+
+Run the `subset_data.py` script with the appropriate parameters:
+
+```bash
+python scripts/subset_data.py --dataset_name <dataset_names> --data_world_size <world_size> --data_rank <rank> [--threads <num_threads>] [--dataset_ratio <ratios>]
+```
+
+Example for downloading files for data rank 5 in a training setup with data world size of 12, using the configuration from 10B/H100.toml:
+
+```bash
+python scripts/subset_data.py \
+  --dataset_name PrimeIntellect/fineweb-edu,PrimeIntellect/fineweb,PrimeIntellect/StackV1-popular,PrimeIntellect/dclm-baseline-1.0-parquet,PrimeIntellect/open-web-math \
+  --data_world_size 12 \
+  --data_rank 5 \
+  --threads 8 \
+  --dataset_ratio 55:10:20:10:5
+```
+
+### Parameters
+
+- `--dataset_name`: Comma-separated list of dataset names on Hugging Face
+- `--data_world_size`: Total number of data ranks in your training setup
+- `--data_rank`: The specific rank for which to download data (0 to data_world_size - 1)
+- `--threads`: (Optional) Number of concurrent download threads (default is 4)
+- `--filter`: (Optional) Comma-separated list of strings to filter file names
+- `--dry_run`: (Optional) If set, the script will list files without downloading them
+- `--max_shards`: (Optional) Maximum number of shards to download (default is 1000)
+- `--dataset_ratio`: (Optional) Colon-separated list of ratios for each dataset
+
+### Notes
+
+- The script automatically creates a `datasets` directory in your project root and organizes downloads within it.
+- It uses multithreading to download files concurrently, significantly speeding up the process.
+- The script automatically selects files based on your data rank and world size, ensuring each rank downloads only its required subset of data.
+- It uses aria2c for efficient downloads when available, falling back to wget if aria2c is not installed.
+- Large files are handled automatically without any additional setup.
+- The script supports multiple datasets and maintains the ratios specified in your configuration.
+
+### Output
+
+The downloaded datasets will be organized in the following structure:
+
+```
+prime/
+├── datasets/
+│   ├── fineweb-edu/
+│   ├── fineweb/
+│   ├── StackV1-popular/
+│   ├── dclm-baseline-1.0-parquet/
+│   └── open-web-math/
+```
+By using this script, you can ensure that all necessary data is downloaded before starting your training process, reducing the likelihood of interruptions due to streaming issues during training. The multithreaded approach allows for faster downloads, making the data preparation process more efficient.
