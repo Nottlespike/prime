@@ -1,7 +1,7 @@
 import argparse
 import logging
 import os
-from datasets import load_dataset, get_dataset_split_names, load_dataset_builder
+from datasets import load_dataset, load_dataset_builder
 from huggingface_hub import HfFolder
 
 logger = logging.getLogger(__name__)
