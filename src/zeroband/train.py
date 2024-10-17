@@ -107,17 +107,17 @@ class Config(BaseConfig):
     ckpt: CkptConfig = CkptConfig()
 
     @model_validator(mode="after")
-    def live_reco_very_check(self):
-        if self.ckpt.live_recovery and self.diloco is None:
-            raise ValueError("Live recovery is a diloco feature. Diloco must be set if live recovery is set")
-        return self
-
-    @model_validator(mode="after")
     def ckpt_diloco_step(self):
         if self.ckpt is not None and self.ckpt.interval is not None and self.diloco is not None:
             assert (
                 self.ckpt.interval % self.diloco.inner_steps == 0
             ), "ckpt interval must be a multiple of diloco inner steps as we only save at the end of an outer step"
+        return self
+
+    @model_validator(mode="after")
+    def validate_live_recovery_rank_src(self):
+        if self.ckpt is not None and self.ckpt.live_recovery_rank_src is not None and self.diloco is None:
+            raise ValueError("live_recovery_rank_src is only supported with diloco")
         return self
 
 
@@ -177,7 +177,7 @@ def train(config: Config):
         num = 1 if isinstance(config.train.ac_ckpt, bool) else config.train.ac_ckpt
         apply_ac_ckpt(model, num)
 
-    elastic_device_mesh = ElasticDeviceMesh(live_recovery=config.ckpt.live_recovery)
+    elastic_device_mesh = ElasticDeviceMesh(enable=config.diloco is not None)
 
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32 if config.train.reduce_fp32 else None
@@ -233,7 +233,6 @@ def train(config: Config):
         data_rank=config.data.data_rank,
         diloco_offloaded_optimizer=diloco.outer_optimizer if config.diloco is not None else None,
         diloco_offloaded_param_list=diloco.param_list_cpu if config.diloco is not None else None,
-        live_recovery_port=elastic_device_mesh.live_recovery.port if config.ckpt.live_recovery else None,
     )
 
     if config.train.torch_compile:
@@ -256,24 +255,34 @@ def train(config: Config):
                 logger.info(f"outer optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}")
                 logger.info(f"outer model hash: {get_tensor_list_signature(diloco.param_list_cpu)}")
 
-    if elastic_device_mesh.live_recovery.need_live_recovery:
-        ckpt_manager.download_and_load_ckpt_from_peers(
-            elastic_device_mesh.live_recovery.get_address(config.ckpt.live_recovery_rank_src)
-        )
-        elastic_device_mesh.live_recovery.need_live_recovery = False
+    if config.ckpt.live_recovery_rank_src is not None:
+        logger.info(f"Start live recovery from rank {config.ckpt.live_recovery_rank_src}")
+        elastic_device_mesh.live_recovery.ask_for_live_ckpt(
+            config.ckpt.live_recovery_rank_src
+        )  # todo: decide if we want to do before or after opt stats init
+
+        ## we create grad buffer and opts stats mamnually, the value will be overwritten by the ckpt but we need the DTensor to be correctly init before loading it
+
+        diloco.outer_optimizer.step()  # need to step to init the DTensor stats
+
+        ckpt_manager.recv_ckpt_from_peer(elastic_device_mesh.global_pg)
+
+        if config.train.log_model_hash:
+            logger.info(f"live recovery outer optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}")
+            logger.info(f"live recovery outer model hash: {get_tensor_list_signature(diloco.param_list_cpu)}")
+            logger.info(f"inner optimizer hash: {get_optimizer_signature(inner_optimizer)}")
+
         training_progress.step += config.diloco.inner_steps
 
-        if config.train.log_model_hash:
-            logger.debug("Pre diloco model: %s", get_module_signature(model))
-
         diloco.step(model, fake=True, flag=training_progress.outer_step)
+        # (sami) do we even need to do a fake step here ? Since the inner model and outer model are the same
+        # the tensor should automatically be zero ==> (sami but later) NO they are not, when we download the cpu model weight we don't update the gpu model weight.
+        training_progress.outer_step += 1
 
         if config.train.log_model_hash:
-            logger.debug("Post diloco model: %s", get_module_signature(model))
-
-        # do we even need to do a fake step here ? Since the inner model and outer model are the same
-        # the tensor should automatically be zero
-        training_progress.outer_step += 1
+            logger.debug("inner diloco model: %s", get_module_signature(model))
+            logger.debug(f"outer diloco optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}")
+            logger.debug(f"outer diloco model hash: {get_tensor_list_signature(diloco.param_list_cpu)}")
 
     if world_info.rank == 0:
         logger_cls = WandbMetricLogger if config.metric_logger_type == "wandb" else DummyMetricLogger
@@ -307,7 +316,10 @@ def train(config: Config):
         time_start_outer = time.perf_counter()
 
         if config.diloco is not None:
+            # this is a patch for now to allow live recovery worker to not affect the all reduce at all
+            num_effective_peers = elastic_device_mesh.global_pg.size()
             elastic_device_mesh.maybe_reinit_global_pg(admit_joiners=True)
+
         # at the beginning of the inner steps we allow joiner to arrive.
         # We maybe reinit before the all reduce but only to allow leaving, not to join anymore
 
@@ -317,6 +329,20 @@ def train(config: Config):
         for inner_step in range(num_inner_steps):
             loss_batch = 0
             z_loss_batch = 0
+
+            maybe_dest_rank = elastic_device_mesh.live_recovery.should_send_ckpt_to()
+            if maybe_dest_rank is not None:
+                logger.info(f"Start live recovery to rank {maybe_dest_rank}")
+                if config.train.log_model_hash:
+                    logger.info(
+                        f"live recovery outer optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}"
+                    )
+                    logger.info(f"live recovery outer model hash: {get_tensor_list_signature(diloco.param_list_cpu)}")
+                    logger.info(f"inner optimizer hash: {get_optimizer_signature(inner_optimizer)}")
+
+                ckpt_manager.send_ckpt_to_peer(elastic_device_mesh.global_pg, maybe_dest_rank)
+
+                elastic_device_mesh.live_recovery.reset()
 
             for grad_acc_step in range(gradient_accumulation_steps):
                 is_accumulating = grad_acc_step < gradient_accumulation_steps - 1
@@ -432,20 +458,20 @@ def train(config: Config):
             if world_info.rank == 0 and config.monitor is not None:
                 monitor.set_stage("outer_loop")
 
+            # todo we could skip this is we don't have live recovery enabled
+            ckpt_manager.cache_inner_optimizer()
+
             time_start_inner = time.perf_counter()
-            diloco.step(model, flag=training_progress.outer_step)
+            diloco.step(model=model, flag=training_progress.outer_step, num_effective_peers=num_effective_peers)
             diloco_time = time.perf_counter() - time_start_inner
 
             if config.train.log_model_hash:
                 logger.debug("inner diloco model: %s", get_module_signature(model))
-                logger.debug(f"inner diloco optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}")
+                logger.debug(f"outer diloco optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}")
+                logger.debug(f"outer diloco optimizer hash: {get_optimizer_signature(diloco.outer_optimizer)}")
                 logger.debug(f"outer diloco model hash: {get_tensor_list_signature(diloco.param_list_cpu)}")
 
         training_progress.outer_step += 1
-
-        if config.ckpt.live_recovery:
-            # we save after each outer step sync when using shm save. Used usually for live recovery
-            ckpt_manager.save_shm()
 
         if (
             config.ckpt.interval is not None
@@ -511,7 +537,7 @@ if __name__ == "__main__":
     # However, in development, we want to know that we broke torch compile
     torch._dynamo.config.suppress_errors = "ZERO_BAND_DEV" not in os.environ
     torch.set_float32_matmul_precision("high")
-    torch.manual_seed(42)  # this ensure same weight init across diloco workers
+    torch.manual_seed(42)
 
     world_info = get_world_info()
     logger = get_logger()
