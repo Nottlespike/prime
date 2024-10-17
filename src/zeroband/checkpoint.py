@@ -1,8 +1,10 @@
+import copy
 from dataclasses import dataclass
 import gc
 import multiprocessing
 import os
 import shutil
+import threading
 import time
 from typing import Any, Literal
 import uuid
@@ -30,14 +32,17 @@ from torch.distributed.checkpoint.stateful import Stateful
 from zeroband.utils.logging import get_logger
 import warnings
 import logging
-from zeroband.utils.wget import wget
 from torch.distributed._tensor.api import DTensor
+from zeroband.utils.state_dict_send_recv import (
+    _get_sendable_state_dict,
+    recv_state_dict,
+    send_state_dict,
+    send_tensor_and_state_dict,
+)
 
 from zeroband.utils.world_info import get_world_info
 
 ## code inspired by torchtitan https://github.com/pytorch/torchtitan/blob/main/torchtitan/checkpoint.py
-
-SHM_PATH = "/dev/shm/zeroband"
 
 
 @dataclass
@@ -157,8 +162,7 @@ class CkptConfig(BaseConfig):
 
     skip_dataloader: bool = False
 
-    live_recovery: bool = False
-    live_recovery_rank_src: int = 0
+    live_recovery_rank_src: int | None = None
 
     data_version: Literal["v1", "v2"] = "v2"
     data_path: str | None = None
@@ -224,7 +228,6 @@ class CkptManager:
         data_rank: int,
         diloco_offloaded_param_list: list[nn.Parameter] | None,
         diloco_offloaded_optimizer: Optimizer | None,
-        live_recovery_port: int | None = None,
     ):
         self.config = config
 
@@ -250,16 +253,7 @@ class CkptManager:
 
         self.non_blocking_process: list[multiprocessing.Process] = []
         self.blocking_process: list[multiprocessing.Process] = []
-
-        if self.config.live_recovery:
-            self.shm_path = os.path.join(SHM_PATH, self.world_info.global_unique_id, "latest")
-            shutil.rmtree(self.shm_path, ignore_errors=True)
-            os.makedirs(self.shm_path, exist_ok=True)
-
-            serve_path = os.path.join(SHM_PATH, self.world_info.global_unique_id)
-            self.live_server = CkptLiveServer(port=live_recovery_port, ckpt_path=serve_path)
-        else:
-            self.shm_path = None
+        self._live_reco_thread: threading.Thread | None = None
 
         if self.world_info.local_rank == 0:
             if self.config.path is not None:
@@ -270,6 +264,9 @@ class CkptManager:
 
             if self.config.remote_data_path is not None:
                 self.check_path_access(self.config.remote_data_path)
+
+        self._inner_optimizer_non_tensor_state_dict = None
+        self._inner_optimizer_tensors = None
 
     def check_path_access(
         self,
@@ -304,22 +301,6 @@ class CkptManager:
         #     # main reason is that we actually don't a cpu model but just a list of cpu parameters.
         #     self.states["diloco_optimizer"] = self.diloco_offloaded_optimizer
 
-    def save_shm(self) -> None:
-        """
-        Save the latest checkpoint in shared memory.
-        """
-        time_start = time.perf_counter()
-        ckpt_path = self.shm_path
-        if self.world_info.local_rank == 0:
-            shutil.rmtree(ckpt_path, ignore_errors=True)
-
-        dist.barrier()
-
-        self._save(ckpt_path)
-        if not self.live_server.is_running:
-            self.live_server.start_server()
-        self._logger.info(f"Saved checkpoint to {ckpt_path} in {time.perf_counter() - time_start} seconds")
-
     def save(self, remote: bool = False) -> None:
         """
         Each rank will save the right shard of the model and optimizer.
@@ -328,7 +309,6 @@ class CkptManager:
 
         Save in the subfolder `step_<step>`.
 
-        shm_save=True mean we previsouly saved to shm so we just do a copy past to disk
         """
 
         step_ckpt_path = os.path.join(self.config.path, f"step_{self.training_progress.step}")
@@ -336,24 +316,16 @@ class CkptManager:
         if remote and self.config.remote is not None:
             remote_ckpt_path = os.path.join(self.config.remote.path, f"step_{self.training_progress.step}")
 
-        if not self.config.live_recovery:
-            # if we are not in self recovery mode we save to disk
-            time_start = time.perf_counter()
-            self._save(step_ckpt_path)
-            self._logger.info(f"Saved checkpoint to {step_ckpt_path} in {time.perf_counter() - time_start} seconds")
-
-        else:
-            # if we are in self recovery mode the ckpt is already in shm and we just copy
-            non_error_barrier()
-            if self.world_info.local_rank == 0:
-                self._async_save_remote(self.shm_path, step_ckpt_path)
+        # if we are not in self recovery mode we save to disk
+        time_start = time.perf_counter()
+        self._save(step_ckpt_path)
+        self._logger.info(f"Saved checkpoint to {step_ckpt_path} in {time.perf_counter() - time_start} seconds")
 
         # push to remote
         non_error_barrier()
         if self.world_info.local_rank == 0:
             if remote and self.config.remote is not None:
-                ckpt_path = self.shm_path if self.config.live_recovery else step_ckpt_path
-                self._async_save_remote(ckpt_path, remote_ckpt_path)
+                self._async_save_remote(step_ckpt_path, remote_ckpt_path)
 
     def _save(self, ckpt_path: str):
         self.wait_for_blocking_job()
@@ -444,9 +416,6 @@ class CkptManager:
                 delete_topk(self.config.path, self.config.topk)
 
     def _del__(self):
-        if self.live_server is not None:
-            shutil.rmtree(self.shm_path, ignore_errors=True)
-            self.live_server.stop()
         self.wait_for_blocking_job()
 
         for process in self.non_blocking_process:
@@ -542,36 +511,124 @@ class CkptManager:
 
         self._logger.info(f"Loaded checkpoint from {resume_ckpt_path} in {time.perf_counter() - time_start} seconds")
 
-    def download_and_load_ckpt_from_peers(self, address: str):
+    def recv_ckpt_from_peer(self, global_pg: dist.ProcessGroup):
+        assert self.diloco_offloaded_param_list is not None, "recv_ckpt_from_peers is only supported with diloco"
+
         time_start = time.perf_counter()
-        ckpt_path = f"/dev/shm/zeroband_reco/node_{self.world_info.global_rank}"
-        path = os.path.join(ckpt_path, f"diloco_{self.world_info.diloco_rank}")
+        self._logger.debug(f"Start receiving ckpt from rank {self.config.live_recovery_rank_src}")
 
-        if self.world_info.local_rank == 0:
-            # only local rank download the ckpt
-            if os.path.exists(path):
-                shutil.rmtree(path)
-            os.makedirs(path, exist_ok=True)
+        jobs = []
+        buffers = []
+        for i, param in enumerate(self.diloco_offloaded_param_list):
+            data = param.data
+            if isinstance(param.data, DTensor):
+                data = param.data.to_local()
 
-            dest_rank = 0
+            buffer = torch.empty_like(data)
+            buffers.append(buffer)
+            jobs.append(global_pg.recv([buffer], self.config.live_recovery_rank_src, i))
 
-            self._logger.info(f"Started downloading ckpt from http://{address}/latest/diloco_{dest_rank} to {path}")
-            wget(
-                source=f"http://{address}/latest/diloco_{dest_rank}",
-                destination=path,
-            )
-            wget(
-                source=f"http://{address}/latest/diloco_{dest_rank}/.metadata",
-                destination=path,
-            )
-            self._logger.info(
-                f"Downloaded checkpoint from http://{address}/diloco_{dest_rank} in {time.perf_counter() - time_start} seconds"
-            )
+        for job in jobs:
+            job.wait()
 
-        dist.barrier()
-        self.load(resume_ckpt_path=ckpt_path, skip_dataloader=True)
+        for buffer, param in zip(buffers, self.diloco_offloaded_param_list):
+            data = param.data
+            if isinstance(data, DTensor):
+                data = data.to_local()
+            data.copy_(buffer)
 
-        # we don't want the dataloader states to be loaded as they are not the same on each rank
+        self._logger.debug("live recovery progress: offloaded model received 1/5")
+
+        outer_opt_state_dict = recv_state_dict(
+            global_pg, self.config.live_recovery_rank_src, self.diloco_offloaded_optimizer.state_dict()
+        )
+        self.diloco_offloaded_optimizer.load_state_dict(outer_opt_state_dict)
+
+        self._logger.debug("live recovery progress: outer optimizer state dict received 2/5")
+
+        training_process_state_dict = recv_state_dict(
+            global_pg, self.config.live_recovery_rank_src, self.training_progress.state_dict()
+        )
+        self.training_progress.load_state_dict(training_process_state_dict)
+        self._logger.debug("live recovery progress: training progress state dict received 3/5")
+
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                p.grad = torch.randn_like(p)
+
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        inner_opt_state_dict = recv_state_dict(
+            global_pg, self.config.live_recovery_rank_src, self.optimizer.state_dict()
+        )
+        self.optimizer.load_state_dict(inner_opt_state_dict)
+
+        self._logger.debug("live recovery progress: inner optimizer state dict received 4/5")
+
+        sheduler_state_dict = recv_state_dict(
+            global_pg, self.config.live_recovery_rank_src, self.scheduler.state_dict()
+        )
+        self.scheduler.load_state_dict(sheduler_state_dict)
+
+        self._logger.debug("live recovery progress: scheduler state dict received 5/5")
+
+        self._logger.debug(
+            f"Received ckpt from rank {self.config.live_recovery_rank_src} in {time.perf_counter() - time_start} seconds"
+        )
+
+    def send_ckpt_to_peer(self, global_pg: dist.ProcessGroup, dest_rank: int):
+        def async_send():
+            assert self.diloco_offloaded_param_list is not None, "send_ckpt_to_peers is only supported with diloco"
+            time_start = time.perf_counter()
+            self._logger.debug(f"Start sending ckpt to rank {dest_rank}")
+
+            try:
+                jobs = []
+                for i, param in enumerate(self.diloco_offloaded_param_list):
+                    data = param.data
+                    if isinstance(data, DTensor):
+                        data = data.to_local()
+                    jobs.append(global_pg.send([data], dest_rank, i))
+
+                for job in jobs:
+                    job.wait()
+
+                send_state_dict(global_pg, self.diloco_offloaded_optimizer.state_dict(), dest_rank)
+                send_state_dict(global_pg, self.training_progress.state_dict(), dest_rank)
+
+                send_tensor_and_state_dict(
+                    global_pg, dest_rank, self._inner_optimizer_non_tensor_state_dict, self._inner_optimizer_tensors
+                )
+
+                send_state_dict(global_pg, self.scheduler.state_dict(), dest_rank)
+            except RuntimeError as e:
+                self._logger.error(f"Error sending ckpt to rank {dest_rank}: {e}")
+            else:
+                self._logger.debug(f"Sent ckpt to rank {dest_rank} in {time.perf_counter() - time_start} seconds")
+
+        thread = threading.Thread(target=async_send)
+        thread.start()
+        self._logger.debug("Live recovery thread started")
+
+        self._live_reco_thread = thread
+
+    def cache_inner_optimizer(self):
+        """
+        Cache the inner optimizer to cpu and cast DTensor to local tensor to be ready to send.
+        """
+
+        if self._live_reco_thread is not None:
+            self._logger.debug("Waiting for live recovery thread to finish")
+            self._live_reco_thread.join()
+            self._live_reco_thread = None
+            self._logger.debug("Live recovery thread finished")
+
+        _inner_optimizer_non_tensor_state_dict, _inner_optimizer_tensors = _get_sendable_state_dict(
+            self.optimizer.state_dict()
+        )
+        self._inner_optimizer_tensors = [tensor.cpu() for tensor in _inner_optimizer_tensors]
+        self._inner_optimizer_non_tensor_state_dict = copy.deepcopy(_inner_optimizer_non_tensor_state_dict)
 
 
 def delete_topk(ckpt_path: str, topk: int):
@@ -586,37 +643,3 @@ def get_checkpoints_to_delete(ckpt_path: str, topk: int) -> list[str]:
     checkpoints = [d for d in os.listdir(ckpt_path) if d.startswith("step_")]
     sorted_checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[1]), reverse=True)
     return [os.path.join(ckpt_path, d) for d in sorted_checkpoints[topk:]]
-
-
-class CkptLiveServer:
-    def __init__(self, port: int, ckpt_path: str):
-        self.port = port
-        self.ckpt_path = ckpt_path
-        self._logger = get_logger()
-        self._process = None
-
-    def start_server(self):
-        self._process = multiprocessing.Process(target=self._start_http_server, daemon=True)
-        self._process.start()
-        self._logger.info(f"Start process serving live ckpt on {self.port}")
-
-    def _start_http_server(self):
-        import http.server
-        import socketserver
-
-        os.makedirs(self.ckpt_path, exist_ok=True)
-        os.chdir(self.ckpt_path)
-        with socketserver.TCPServer(("", self.port), http.server.SimpleHTTPRequestHandler) as httpd:
-            self._logger.debug(f"Start serving live ckpt on {self.port}")
-            httpd.serve_forever()
-
-    def stop(self):
-        if self._process is not None:
-            self._process.terminate()
-
-    def __del__(self):
-        self.stop()
-
-    @property
-    def is_running(self) -> bool:
-        return self._process is not None and self._process.is_alive()

@@ -2,7 +2,6 @@ import sys
 import os
 import time
 from torch.distributed.device_mesh import init_device_mesh
-from zeroband.utils import get_random_available_port
 from zeroband.utils.world_info import get_world_info
 from zeroband.utils.logging import get_logger
 import torch.distributed as dist
@@ -22,10 +21,6 @@ HEARTBEAT_INTERVAL = int(
 HEARTBEAT_TIMEOUT = int(
     os.getenv("ZERO_BAND_EDM_HEARTBEAT_TIMEOUT_SECONDS", "10")
 )  # Time in seconds after which a node is considered dead if no heartbeat is received
-
-LIVE_RECO_PORT = os.environ.get("ZERO_BAND_LIVE_RECO_PORT", None)
-
-LIVE_RECO_ADDR = os.environ.get("ZERO_BAND_LIVE_RECO_ADDR", "localhost")
 
 
 class ElasticDeviceMesh:
@@ -47,17 +42,17 @@ class ElasticDeviceMesh:
     local_pg: dist.ProcessGroup
     global_pg: dist.ProcessGroup
 
-    def __init__(self, backend: str = "cpu:gloo,cuda:nccl", live_recovery: bool = False):
+    def __init__(self, backend: str = "cpu:gloo,cuda:nccl", enable: bool = True):
         self._logger = get_logger()
         self.world_info = get_world_info()
 
         # Initialize global process group
         self.global_pg = FakeProcessGroup(self.world_info.rank, 1)
-        self.live_recovery = LiveRecovery(enable=live_recovery)
 
-        if self.world_info.global_world_size > 1:
+        self.enable = enable
+        if enable:
             self._init_global_pg()
-
+            self.live_recovery = LiveRecovery(store=self.global_store)
 
         # Initialize local process group
         dist.init_process_group(backend=backend)
@@ -136,11 +131,10 @@ class ElasticDeviceMesh:
     def _init_global_pg(self) -> None:
         # Each rank gets its own global store with global rank 0 as the master
         time_start = time.perf_counter()
-        
+
         self._logger.info(
             f"[{self.world_info.global_unique_id}] Elastic Device mesh init: Looking for peers via {self.world_info.global_addr}:{self.world_info.global_port}"
         )
-
 
         self._global_leader = self.world_info.global_rank == 0
         self.global_store = dist.TCPStore(
@@ -174,7 +168,6 @@ class ElasticDeviceMesh:
             self.mesh_count = int(self.global_store.get("mesh_count").decode("utf-8"))
             prefix_store = dist.PrefixStore(f"mesh_{self.mesh_count}", self.global_store)
             self._logger.debug(f"Created prefix store with mesh_{self.mesh_count}")
-            self.live_recovery.need_live_recovery = self.live_recovery.enable
         else:
             # TODO: Could be in "reinit" status. We probably just recurse until running in this case
             raise RuntimeError(f"Unknown status {self.global_status}")
@@ -196,8 +189,6 @@ class ElasticDeviceMesh:
                 self.global_store.set(f"barrier_{i}", "null")
         self.global_status = "running"
         self.global_store.set(f"rank_{self.world_info.global_unique_id}", str(self.world_info.global_rank))
-
-        self.live_recovery.init_live_endpoint(self.global_store)
 
         self._last_resolved_time = self.global_store.get("resolved_time").decode("utf-8")
 
@@ -328,8 +319,8 @@ class ElasticDeviceMesh:
             bool: True if the global_pg was reinitialized, False otherwise.
         """
 
-        if self.world_info.global_world_size == 1:
-            # no op if we only have one node
+        if not self.enable:
+            # no op if disabled
             return
 
         time_start = time.perf_counter()
@@ -390,6 +381,8 @@ class ElasticDeviceMesh:
         # Update rank if needed (otherwise, the next remap will do the lookup incorrectly)
         if old_global_rank != self.world_info.global_rank:
             self.global_store.set(f"rank_{self.world_info.global_unique_id}", str(self.world_info.global_rank))
+            self.live_recovery.reset()
+
         self._logger.debug("Reinitialized global_pg done in %s seconds", time.perf_counter() - time_start)
 
         # TODO: We need to reset the self.world_info.global_rank reference
@@ -442,36 +435,27 @@ class ElasticDeviceMesh:
 
 
 class LiveRecovery:
-    """
-    Each Node exposes an http server saving the lastest ckpt.
-    Each adress serving a ckpt is saved in the store.
-    When a new node is joinings it retrieves the adress from the store and downloads the latest ckpt.
-    """
-
-    def __init__(self, enable: bool):
-        self.need_live_recovery = False
-        self.store: dist.Store | None = None
+    def __init__(self, store: dist.Store):
+        self.logger = get_logger()
         self.world_info = get_world_info()
-        self._logger = get_logger()
 
-        self.enable = enable
+        self.store = dist.PrefixStore("live_recovery", store)
+        self.reset()
 
-        if LIVE_RECO_PORT is None:
-            self.port = get_random_available_port()
-        else:
-            self.port = int(LIVE_RECO_PORT)
+    def reset(self):
+        self.store.set(f"rank_{self.world_info.global_rank}", "null")
 
-    def init_live_endpoint(self, store: dist.Store):
-        """
-        Put its own address to the store so that other nodes can connect to it for live recovery
-        """
-        if not self.enable:
-            return
-        self.store = dist.PrefixStore("live_reco_address", store)
+    def should_send_ckpt_to(self) -> int | None:
+        """use this function to check if someone is awaiting for a live ckpt"""
+        data = self.store.get(f"rank_{self.world_info.global_rank}").decode("utf-8")
+        if data == "null":
+            return None
+        try:
+            return int(data)
+        except ValueError as e:
+            self.logger.error(f"Error parsing live recovery data: {e}")
+            return None
 
-        self._logger.debug(f"Live recovery address: {LIVE_RECO_ADDR}:{self.port}")
-        self.store.set(f"address_{self.world_info.global_rank}", f"{LIVE_RECO_ADDR}:{self.port}")
-
-    def get_address(self, global_rank: int) -> str:
-        """Get the live recovery address for a given rank."""
-        return self.store.get(f"address_{global_rank}").decode("utf-8")
+    def ask_for_live_ckpt(self, rank: int) -> int | None:
+        """use this function to send a signal to a node to ask for a live ckpt"""
+        self.store.set(f"rank_{rank}", str(self.world_info.global_rank))
